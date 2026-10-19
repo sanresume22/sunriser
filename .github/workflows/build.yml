@@ -1,0 +1,39 @@
+name: Build SunRiser
+on: [push, workflow_dispatch]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -G "Visual Studio 17 2022" -A x64
+      - run: cmake --build build --config Release --target SunRiser_VST3 SunRiser_Standalone
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SunRiser-Windows
+          path: |
+            build/SunRiser_artefacts/Release/VST3/SunRiser.vst3
+            build/SunRiser_artefacts/Release/Standalone/SunRiser.exe
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -G Xcode
+      - run: cmake --build build --config Release --target SunRiser_VST3 SunRiser_AU SunRiser_Standalone -- -quiet
+      - name: Ad-hoc sign
+        run: |
+          for p in build/SunRiser_artefacts/Release/VST3/SunRiser.vst3 build/SunRiser_artefacts/Release/AU/SunRiser.component build/SunRiser_artefacts/Release/Standalone/SunRiser.app; do
+            codesign --force --deep -s - "$p"
+          done
+      - name: Zip (keeps bundle structure)
+        run: |
+          cd build/SunRiser_artefacts/Release
+          ditto -c -k --keepParent VST3/SunRiser.vst3 $GITHUB_WORKSPACE/SunRiser-VST3-mac.zip
+          ditto -c -k --keepParent AU/SunRiser.component $GITHUB_WORKSPACE/SunRiser-AU-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SunRiser-macOS
+          path: |
+            SunRiser-VST3-mac.zip
+            SunRiser-AU-mac.zip
