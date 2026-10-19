@@ -39,6 +39,7 @@ public:
     }
 
     void resized() override { slider.setBounds (getLocalBounds().withTrimmedTop (16)); }
+    void enablementChanged() override { setAlpha (isEnabled() ? 1.0f : 0.35f); }
 
 private:
     String name;
@@ -47,16 +48,15 @@ private:
 };
 
 //==============================================================================
-class Segmented : public Component, public SettableTooltipClient
+/** Pill-shaped segmented selector. Subclasses decide what selecting a segment does. */
+class SegmentedBase : public Component, public SettableTooltipClient
 {
 public:
-    Segmented (RangedAudioParameter& p, StringArray segmentLabels, const String& tip)
-        : labels (std::move (segmentLabels)),
-          attachment (p, [this] (float v) { index = roundToInt (v); repaint(); }, nullptr)
-    {
-        setTooltip (tip);
-        attachment.sendInitialUpdate();
-    }
+    explicit SegmentedBase (StringArray segmentLabels, float fontSize = 12.5f)
+        : labels (std::move (segmentLabels)), textSize (fontSize) {}
+
+    void setIndex (int i) { if (i != index) { index = i; repaint(); } }
+    int getIndex() const  { return index; }
 
     void paint (Graphics& g) override
     {
@@ -82,7 +82,7 @@ public:
                 g.fillRoundedRectangle (seg, 6.0f);
             }
             g.setColour (i == index ? Colours::white : (i == hover ? t.text : t.textDim));
-            g.setFont (sunFont (12.5f, true));
+            g.setFont (sunFont (textSize, true));
             g.drawText (labels[i], seg, Justification::centred);
         }
     }
@@ -90,18 +90,52 @@ public:
     void mouseDown (const MouseEvent& e) override
     {
         const int i = segmentAt (e.x);
-        if (i != index) attachment.setValueAsCompleteGesture ((float) i);
+        if (i != index) select (i);
     }
     void mouseMove (const MouseEvent& e) override { setHover (segmentAt (e.x)); }
     void mouseExit (const MouseEvent&) override   { setHover (-1); }
+
+protected:
+    virtual void select (int i) = 0;
 
 private:
     int segmentAt (int x) const { return jlimit (0, labels.size() - 1, x * labels.size() / jmax (1, getWidth())); }
     void setHover (int h) { if (h != hover) { hover = h; repaint(); } }
 
     StringArray labels;
-    ParameterAttachment attachment;
+    float textSize;
     int index = 0, hover = -1;
+};
+
+/** Segmented control bound to a choice parameter. */
+class Segmented : public SegmentedBase
+{
+public:
+    Segmented (RangedAudioParameter& p, StringArray segmentLabels, const String& tip, float fontSize = 12.5f)
+        : SegmentedBase (std::move (segmentLabels), fontSize),
+          attachment (p, [this] (float v) { setIndex (roundToInt (v)); if (onChange) onChange(); }, nullptr)
+    {
+        setTooltip (tip);
+        attachment.sendInitialUpdate();
+    }
+    std::function<void()> onChange;
+
+protected:
+    void select (int i) override { attachment.setValueAsCompleteGesture ((float) i); }
+
+private:
+    ParameterAttachment attachment;
+};
+
+/** Segmented control for GUI-only state. */
+class LocalSegmented : public SegmentedBase
+{
+public:
+    LocalSegmented (StringArray segmentLabels, float fontSize = 12.5f) : SegmentedBase (std::move (segmentLabels), fontSize) {}
+    std::function<void (int)> onSelect;
+
+protected:
+    void select (int i) override { setIndex (i); if (onSelect) onSelect (i); }
 };
 
 //==============================================================================
@@ -256,7 +290,7 @@ public:
     void mouseWheelMove (const MouseEvent&, const MouseWheelDetails& w) override
     {
         auto src = proc.getSource();
-        if (src == nullptr || w.deltaY == 0.0f) return;
+        if (src == nullptr || exactlyEqual (w.deltaY, 0.0f)) return;
         const int n = src->audio.getNumSamples();
         viewEnd = jlimit (jmin (n, (int) (src->sampleRate * 0.1)), n, (int) (viewEnd * (w.deltaY > 0 ? 0.8 : 1.25)));
         peaksWidth = -1;
@@ -339,7 +373,7 @@ class RiserView : public Component, public SettableTooltipClient
 public:
     explicit RiserView (SunRiserProcessor& p) : proc (p)
     {
-        setTooltip ("Each bar is one repeat of the syllable: height = volume, the bright line = pitch, the dashed line = filter.");
+        setTooltip ("Bars = stutter hits (height = volume). Glow = reverse swell. Bright line = pitch, dashed line = filter.");
     }
 
     void paint (Graphics& g) override
@@ -359,34 +393,43 @@ public:
         }
 
         const auto& s = render->settings;
+        const bool hasStutter = s.engine != engineReverse;
+        const bool hasSwell   = ! render->swellEnvelope.empty();
         auto info = r.reduced (14.0f, 8.0f).removeFromTop (16.0f);
         auto plot = r.reduced (14.0f, 10.0f).withTrimmedTop (24.0f);
         const double totalQ = s.bars * render->beatsPerBar;
-        const float L = (float) render->lengthSec;
+        const double qSec = 60.0 / s.bpm;
+        const double total = jmax (0.001, render->lengthSec);
+        auto xAt = [&] (double sec) { return plot.getX() + (float) (sec / total) * plot.getWidth(); };
+        const float dropX = xAt (render->dropSec);
 
         // header line
+        static const char* modeText[] = { "STUTTER", "REVERSE SWELL", "STUTTER + REVERSE" };
         g.setFont (sunFont (11.5f, true));
         g.setColour (t.textDim);
         const auto bpm = std::abs (s.bpm - std::round (s.bpm)) < 0.01 ? String (roundToInt (s.bpm)) : String (s.bpm, 1);
-        g.drawText (String (s.bars) + (s.bars == 1 ? " BAR" : " BARS") + "   -   " + bpm + " BPM   -   "
-                      + String (s.beatsNum) + "/" + String (s.beatsDen) + "   -   " + String ((int) render->grains.size()) + " HITS   -   "
-                      + String (L, 2) + " s",
-                    info, Justification::centredLeft);
+        String text = String (modeText[jlimit (0, 2, s.engine)]) + "   -   " + String (s.bars) + (s.bars == 1 ? " BAR" : " BARS")
+                    + "   -   " + bpm + " BPM   -   " + String (s.beatsNum) + "/" + String (s.beatsDen);
+        if (hasStutter) text << "   -   " << (int) render->grains.size() << " HITS";
+        g.drawText (text, info, Justification::centredLeft);
 
         auto legend = info.removeFromRight (190.0f);
-        g.setColour (t.accentC);
-        g.fillRoundedRectangle (legend.getX(), legend.getCentreY() - 1.5f, 16.0f, 3.0f, 1.5f);
-        g.setColour (t.textDim);
-        g.drawText ("PITCH", legend.withTrimmedLeft (22.0f), Justification::centredLeft);
-        g.setColour (t.text.withAlpha (0.55f));
-        for (int i = 0; i < 3; ++i) g.fillRect (legend.getX() + 86.0f + i * 6.0f, legend.getCentreY() - 0.75f, 3.5f, 1.5f);
-        g.setColour (t.textDim);
-        g.drawText ("FILTER", legend.withTrimmedLeft (110.0f), Justification::centredLeft);
-
-        // beat & bar grid
-        for (int q = 0; q <= (int) std::floor (totalQ); ++q)
+        if (hasStutter)
         {
-            const float x = plot.getX() + (float) (q / totalQ) * plot.getWidth();
+            g.setColour (t.accentC);
+            g.fillRoundedRectangle (legend.getX(), legend.getCentreY() - 1.5f, 16.0f, 3.0f, 1.5f);
+            g.setColour (t.textDim);
+            g.drawText ("PITCH", legend.withTrimmedLeft (22.0f), Justification::centredLeft);
+            g.setColour (t.text.withAlpha (0.55f));
+            for (int i = 0; i < 3; ++i) g.fillRect (legend.getX() + 86.0f + i * 6.0f, legend.getCentreY() - 0.75f, 3.5f, 1.5f);
+            g.setColour (t.textDim);
+            g.drawText ("FILTER", legend.withTrimmedLeft (110.0f), Justification::centredLeft);
+        }
+
+        // beat & bar grid (up to the drop)
+        for (int q = 0; q <= (int) std::floor (totalQ + 1.0e-6); ++q)
+        {
+            const float x = xAt (q * qSec);
             const double barPos = q / render->beatsPerBar;
             const bool isBar = std::abs (barPos - std::round (barPos)) < 1.0e-6;
             g.setColour (t.textDim.withAlpha (isBar ? 0.35f : 0.10f));
@@ -399,49 +442,72 @@ public:
             }
         }
 
-        // hits
-        g.setGradientFill (ColourGradient (t.accentA, plot.getX(), 0.0f, t.accentB, plot.getRight(), 0.0f, false));
-        for (const auto& gr : render->grains)
+        // reverse swell (mirrored glow)
+        if (hasSwell)
         {
-            const float x0 = plot.getX() + (float) (gr.startSec / L) * plot.getWidth();
-            const float w  = jmax (1.5f, (float) (gr.lengthSec / L) * plot.getWidth() - 1.0f);
-            const float h  = plot.getHeight() * (0.15f + 0.65f * gr.gain);
-            g.fillRoundedRectangle (x0, plot.getBottom() - h, w, h, jmin (2.0f, w * 0.5f));
-        }
-        g.setColour (t.accentC.withAlpha (0.9f));
-        for (const auto& gr : render->grains)
-        {
-            const float x0 = plot.getX() + (float) (gr.startSec / L) * plot.getWidth();
-            const float w  = jmax (1.5f, (float) (gr.lengthSec / L) * plot.getWidth() - 1.0f);
-            const float h  = plot.getHeight() * (0.15f + 0.65f * gr.gain);
-            g.fillRect (x0, plot.getBottom() - h, w, 2.0f);
+            const auto& env = render->swellEnvelope;
+            const int n = (int) env.size();
+            const float mid = plot.getBottom() - plot.getHeight() * 0.5f;
+            const float half = plot.getHeight() * 0.48f;
+            Path p;
+            p.startNewSubPath (plot.getX(), mid);
+            for (int i = 0; i < n; ++i)
+                p.lineTo (plot.getX() + ((float) i + 0.5f) / (float) n * plot.getWidth(), mid - env[(size_t) i] * half);
+            p.lineTo (plot.getRight(), mid);
+            for (int i = n - 1; i >= 0; --i)
+                p.lineTo (plot.getX() + ((float) i + 0.5f) / (float) n * plot.getWidth(), mid + env[(size_t) i] * half);
+            p.closeSubPath();
+            const float alpha = hasStutter ? 0.45f : 0.9f;
+            g.setGradientFill (ColourGradient (t.accentB.withAlpha (alpha * 0.4f), plot.getX(), 0.0f, t.accentA.withAlpha (alpha), dropX, 0.0f, false));
+            g.fillPath (p);
+            g.setColour (t.accentC.withAlpha (hasStutter ? 0.5f : 0.9f));
+            g.strokePath (p, PathStrokeType (1.2f));
         }
 
-        // filter curve (dashed)
-        if (s.sweep > 0.001f)
+        if (hasStutter)
         {
-            Path fp;
-            for (int i = 0; i <= 120; ++i)
+            // hits
+            g.setGradientFill (ColourGradient (t.accentA, plot.getX(), 0.0f, t.accentB, dropX, 0.0f, false));
+            for (const auto& gr : render->grains)
             {
-                const float p = (float) i / 120.0f;
-                const float norm = std::log (lowpassAt (p, s.sweep) / 20.0f) / std::log (1000.0f);
-                const Point<float> pt (plot.getX() + p * plot.getWidth(), plot.getBottom() - norm * plot.getHeight() * 0.95f);
-                if (i == 0) fp.startNewSubPath (pt); else fp.lineTo (pt);
+                const float x0 = xAt (gr.startSec);
+                const float w  = jmax (1.5f, xAt (gr.startSec + gr.lengthSec) - x0 - 1.0f);
+                const float h  = plot.getHeight() * (0.15f + 0.65f * gr.gain);
+                g.fillRoundedRectangle (x0, plot.getBottom() - h, w, h, jmin (2.0f, w * 0.5f));
             }
-            Path dashed;
-            const float d[] = { 5.0f, 4.0f };
-            PathStrokeType (1.4f).createDashedStroke (dashed, fp, d, 2);
-            g.setColour (t.text.withAlpha (0.55f));
-            g.fillPath (dashed);
-        }
+            g.setColour (t.accentC.withAlpha (0.9f));
+            for (const auto& gr : render->grains)
+            {
+                const float x0 = xAt (gr.startSec);
+                const float w  = jmax (1.5f, xAt (gr.startSec + gr.lengthSec) - x0 - 1.0f);
+                const float h  = plot.getHeight() * (0.15f + 0.65f * gr.gain);
+                g.fillRect (x0, plot.getBottom() - h, w, 2.0f);
+            }
 
-        // pitch curve
-        {
+            // filter curve (dashed)
+            if (s.sweep > 0.001f)
+            {
+                Path fp;
+                for (int i = 0; i <= 120; ++i)
+                {
+                    const float p = (float) i / 120.0f;
+                    const float norm = std::log (lowpassAt (p, s.sweep) / 20.0f) / std::log (1000.0f);
+                    const Point<float> pt (xAt (p * render->dropSec), plot.getBottom() - norm * plot.getHeight() * 0.95f);
+                    if (i == 0) fp.startNewSubPath (pt); else fp.lineTo (pt);
+                }
+                Path dashed;
+                const float d[] = { 5.0f, 4.0f };
+                PathStrokeType (1.4f).createDashedStroke (dashed, fp, d, 2);
+                g.setColour (t.text.withAlpha (0.55f));
+                g.fillPath (dashed);
+            }
+
+            // pitch curve
             Path pp;
             for (int i = 0; i <= 120; ++i)
             {
                 const float p = (float) i / 120.0f;
-                const Point<float> pt (plot.getX() + p * plot.getWidth(),
+                const Point<float> pt (xAt (p * render->dropSec),
                                        plot.getBottom() - 4.0f - (pitchAt (p, s.pitch) / 24.0f) * (plot.getHeight() - 8.0f));
                 if (i == 0) pp.startNewSubPath (pt); else pp.lineTo (pt);
             }
@@ -451,11 +517,28 @@ public:
             g.strokePath (pp, PathStrokeType (2.0f, PathStrokeType::curved, PathStrokeType::rounded));
         }
 
+        // landing syllable after the drop
+        if (render->landSec > 0.0)
+        {
+            auto land = Rectangle<float> (dropX + 2.0f, plot.getY() + plot.getHeight() * 0.3f,
+                                          jmax (4.0f, xAt (render->dropSec + render->landSec) - dropX - 2.0f), plot.getHeight() * 0.4f);
+            g.setColour (t.text.withAlpha (0.25f));
+            g.fillRoundedRectangle (land, 4.0f);
+            g.setColour (t.text);
+            g.drawRoundedRectangle (land, 4.0f, 1.0f);
+            g.setFont (sunFont (10.0f, true));
+            g.drawText ("LAND", land, Justification::centred);
+        }
+
         // drop marker
         g.setColour (t.accentB);
-        g.fillRect (plot.getRight() - 1.0f, plot.getY(), 2.0f, plot.getHeight());
+        g.fillRect (dropX - 1.0f, plot.getY(), 2.0f, plot.getHeight());
+        auto dropPill = Rectangle<float> (dropX - 46.0f, plot.getY() + 1.0f, 40.0f, 15.0f);
+        g.setColour (wellColour (t).withAlpha (0.85f));
+        g.fillRoundedRectangle (dropPill, 7.0f);
+        g.setColour (t.accentB);
         g.setFont (sunFont (10.5f, true));
-        g.drawText ("DROP", Rectangle<float> (plot.getRight() - 44.0f, plot.getY() + 2.0f, 40.0f, 12.0f), Justification::topRight);
+        g.drawText ("DROP", dropPill, Justification::centred);
 
         // playhead
         const float prog = proc.getPlayProgress();
@@ -573,12 +656,14 @@ class MainPanel : public Component, public FileDragAndDropTarget, private Timer
 public:
     MainPanel (SunRiserProcessor& p, SunRiserEditor& ed)
         : proc (p), editor (ed), wave (p), riser (p), dragOut (p),
-          lengthSeg (*p.apvts.getParameter (IDs::length),    { "1", "2", "4", "8" },
-                     "How many bars the riser lasts. It ends exactly on the bar line - start your MIDI note this many bars before the drop."),
+          lengthSeg (*p.apvts.getParameter (IDs::length),    { "1 BAR", "2 BARS", "4 BARS", "8 BARS" },
+                     "How many bars the riser lasts. It ends exactly on the bar line - start your MIDI note this many bars before the drop.", 11.5f),
           feelSeg   (*p.apvts.getParameter (IDs::mode),      { "Smooth", "Steps" },
                      "Smooth: repeats speed up continuously.  Steps: classic 1/4 > 1/8 > 1/16 snare-roll doubling, locked to the grid."),
           fromSeg   (*p.apvts.getParameter (IDs::startRate), { "1/2", "1/4", "1/8" }, "Repeat rate at the start of the riser"),
           toSeg     (*p.apvts.getParameter (IDs::endRate),   { "1/16", "1/32", "1/64" }, "Repeat rate at the very end, just before the drop"),
+          modeSeg   (*p.apvts.getParameter (IDs::engine),    { "STUTTER", "REVERSE", "BOTH" },
+                     "Stutter: accelerating repeats.  Reverse: reversed-reverb swell into the drop.  Both: layer them.", 11.5f),
           curve  (p.apvts, IDs::curve,  "Curve",  "How late the acceleration kicks in. Higher = stays slow longer, then rushes into the drop"),
           chop   (p.apvts, IDs::chop,   "Chop",   "How much of each gap the syllable fills. Lower = tighter, choppier hits"),
           pitch  (p.apvts, IDs::pitch,  "Pitch",  "How far the syllable pitches up by the drop"),
@@ -586,11 +671,17 @@ public:
           space  (p.apvts, IDs::space,  "Space",  "Reverb that builds as the riser grows"),
           swell  (p.apvts, IDs::swell,  "Swell",  "Volume fade-in, from quiet to full"),
           width  (p.apvts, IDs::width,  "Width",  "Stereo spread: hits ping-pong left/right more as it builds"),
-          output (p.apvts, IDs::output, "Output", "Output level")
+          output (p.apvts, IDs::output, "Output", "Output level"),
+          revSize (p.apvts, IDs::revSize, "Size",  "How much of the riser the reverse swell fills (reverb length follows the bars)"),
+          revTone (p.apvts, IDs::revTone, "Tone",  "Darker or brighter reverb"),
+          revGap  (p.apvts, IDs::revPre,  "Gap",   "Cut the swell this long before the drop, leaving a breath of silence"),
+          blend   (p.apvts, IDs::blend,   "Blend", "Both mode: balance between the stutter and the reverse swell"),
+          output2 (p.apvts, IDs::output,  "Output", "Output level")
     {
         for (auto* c : std::initializer_list<Component*> { &wave, &riser, &play, &dragOut, &themeBox, &loadBtn, &autoBtn,
                                                            &lengthSeg, &feelSeg, &fromSeg, &toSeg,
-                                                           &curve, &chop, &pitch, &sweep, &space, &swell, &width, &output })
+                                                           &curve, &chop, &pitch, &sweep, &space, &swell, &width, &output,
+                                                           &modeSeg, &landBtn, &pageSeg, &revSize, &revTone, &revGap, &blend, &output2 })
             addAndMakeVisible (c);
 
         const auto& themes = getThemes();
@@ -608,6 +699,14 @@ public:
         loadBtn.onClick = [this] { browse(); };
         autoBtn.setTooltip ("Find the first syllable again automatically (or double-click the waveform)");
         autoBtn.onClick = [this] { proc.autoDetectSlice(); };
+
+        landBtn.setClickingTogglesState (true);
+        landBtn.setTooltip ("Also play the original syllable right on the drop");
+        landAttachment = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, IDs::land, landBtn);
+        pageSeg.setTooltip ("Which engine's controls to show below");
+        pageSeg.onSelect = [this] (int i) { page = i; updatePage(); };
+        modeSeg.onChange = [this] { modeChanged(); };
+        modeChanged();
 
         wave.refresh();
         startTimerHz (30);
@@ -650,15 +749,43 @@ public:
 
         section (g, t, sourceArea,  "SOURCE", "drop audio  -  drag the handles to fine-tune the syllable  -  scroll to zoom");
         section (g, t, riserArea,   "RISER",  "");
-        section (g, t, rhythmArea,  "RHYTHM", "");
-        section (g, t, toneArea,    "TONE",   "");
-        section (g, t, dynArea,     "DYNAMICS", "");
-
-        g.setFont (sunFont (11.5f, true));
-        for (auto [name, seg] : { std::pair<const char*, Component*> { "LENGTH", &lengthSeg }, { "FEEL", &feelSeg }, { "FROM", &fromSeg }, { "TO", &toSeg } })
+        if (page == 0)
         {
+            section (g, t, rhythmArea,  "STUTTER RHYTHM", "");
+            section (g, t, toneArea,    "TONE",   "");
+            section (g, t, dynArea,     "DYNAMICS", "");
+
+            g.setFont (sunFont (11.5f, true));
+            for (auto [name, seg] : { std::pair<const char*, Component*> { "FEEL", &feelSeg }, { "FROM", &fromSeg }, { "TO", &toSeg } })
+            {
+                g.setColour (t.textDim);
+                g.drawText (name, Rectangle<int> (rhythmArea.getX() + 14, seg->getY(), 60, seg->getHeight()), Justification::centredLeft);
+            }
+        }
+        else
+        {
+            section (g, t, revArea, "REVERSE SWELL", "");
+            section (g, t, mixArea, "MIX", "");
+
+            auto how = Rectangle<float> ((float) revArea.getX() + 284.0f, (float) revArea.getY() + 44.0f, (float) revArea.getWidth() - 304.0f, 136.0f);
+            g.setColour (t.accentA);
+            g.setFont (sunFont (12.0f, true));
+            g.drawText ("HOW IT WORKS", how.removeFromTop (18.0f), Justification::centredLeft);
             g.setColour (t.textDim);
-            g.drawText (name, Rectangle<int> (rhythmArea.getX() + 14, seg->getY(), 60, seg->getHeight()), Justification::centredLeft);
+            g.setFont (sunFont (12.5f));
+            g.drawFittedText ("The first syllable is reversed, sent through a long reverb, then reversed again. "
+                              "The reverb swells up out of nothing and peaks right on the drop - "
+                              "the classic reverse-reverb riser, done for you.\n\n"
+                              "Size = how much of the riser it fills.  Tone = dark to bright.  "
+                              "Gap = a breath of silence before the drop.",
+                              how.reduced (0.0f, 4.0f).toNearestInt(), Justification::topLeft, 8, 1.0f);
+
+            if (modeSeg.getIndex() != 2)
+            {
+                g.setColour (t.textDim);
+                g.setFont (sunFont (11.0f));
+                g.drawText ("Blend works in BOTH mode", Rectangle<int> (mixArea.getX(), mixArea.getBottom() - 22, mixArea.getWidth(), 16), Justification::centred);
+            }
         }
 
         g.setColour (statusUntil > Time::getMillisecondCounter() ? t.accentA : t.textDim);
@@ -681,15 +808,27 @@ public:
         wave.setBounds (sourceArea.reduced (12).withTrimmedTop (30));
 
         riserArea = { 20, 252, W - 40, 176 };
-        riser.setBounds (riserArea.reduced (12).withTrimmedTop (26));
+        riser.setBounds (riserArea.reduced (12).withTrimmedTop (28));
+        lengthSeg.setBounds (riserArea.getX() + 92, riserArea.getY() + 7, 250, 27);
+        modeSeg.setBounds (lengthSeg.getRight() + 12, riserArea.getY() + 7, 270, 27);
+        landBtn.setBounds (modeSeg.getRight() + 12, riserArea.getY() + 7, 132, 27);
+        pageSeg.setBounds (riserArea.getRight() - 12 - 214, riserArea.getY() + 7, 214, 27);
 
         rhythmArea = { 20, 438, 450, 196 };
         toneArea   = { 480, 438, 265, 196 };
         dynArea    = { 755, 438, W - 20 - 755, 196 };
 
-        Segmented* segs[] = { &lengthSeg, &feelSeg, &fromSeg, &toSeg };
-        for (int i = 0; i < 4; ++i)
-            segs[i]->setBounds (rhythmArea.getX() + 66, rhythmArea.getY() + 40 + i * 38, 200, 30);
+        Segmented* segs[] = { &feelSeg, &fromSeg, &toSeg };
+        for (int i = 0; i < 3; ++i)
+            segs[i]->setBounds (rhythmArea.getX() + 66, rhythmArea.getY() + 50 + i * 46, 200, 32);
+
+        revArea = { 20, 438, 640, 196 };
+        mixArea = { 670, 438, W - 20 - 670, 196 };
+        Knob* rev[] = { &revSize, &revTone, &revGap };
+        for (int i = 0; i < 3; ++i)
+            rev[i]->setBounds (revArea.getX() + 14 + i * 88, revArea.getY() + 46, 84, 136);
+        blend.setBounds   (mixArea.getCentreX() - 100, mixArea.getY() + 40, 90, 136);
+        output2.setBounds (mixArea.getCentreX() + 10,  mixArea.getY() + 40, 90, 136);
 
         curve.setBounds (rhythmArea.getX() + 278, rhythmArea.getY() + 46, 80, 136);
         chop.setBounds  (rhythmArea.getX() + 362, rhythmArea.getY() + 46, 80, 136);
@@ -705,6 +844,26 @@ public:
     }
 
 private:
+    void modeChanged()
+    {
+        const int mode = modeSeg.getIndex();
+        if (mode == 0) page = 0;
+        if (mode == 1) page = 1;
+        pageSeg.setIndex (page);
+        pageSeg.setVisible (mode == 2);
+        blend.setEnabled (mode == 2);
+        updatePage();
+    }
+
+    void updatePage()
+    {
+        for (auto* c : std::initializer_list<Component*> { &feelSeg, &fromSeg, &toSeg, &curve, &chop, &pitch, &sweep, &space, &swell, &width, &output })
+            c->setVisible (page == 0);
+        for (auto* c : std::initializer_list<Component*> { &revSize, &revTone, &revGap, &blend, &output2 })
+            c->setVisible (page == 1);
+        repaint();
+    }
+
     void timerCallback() override
     {
         if (proc.getSourceVersion() != lastSource || proc.getSliceVersion() != lastSlice)
@@ -819,11 +978,16 @@ private:
     DragOutButton dragOut;
     ComboBox themeBox;
     TextButton loadBtn { "LOAD" }, autoBtn { "AUTO-DETECT" };
-    Segmented lengthSeg, feelSeg, fromSeg, toSeg;
+    Segmented lengthSeg, feelSeg, fromSeg, toSeg, modeSeg;
     Knob curve, chop, pitch, sweep, space, swell, width, output;
+    Knob revSize, revTone, revGap, blend, output2;
+    TextButton landBtn { "LAND ON DROP" };
+    std::unique_ptr<AudioProcessorValueTreeState::ButtonAttachment> landAttachment;
+    LocalSegmented pageSeg { { "EDIT STUTTER", "EDIT REVERSE" }, 11.0f };
+    int page = 0;
     std::unique_ptr<FileChooser> chooser;
 
-    Rectangle<int> sourceArea, riserArea, rhythmArea, toneArea, dynArea, footerArea;
+    Rectangle<int> sourceArea, riserArea, rhythmArea, toneArea, dynArea, revArea, mixArea, footerArea;
     int lastSource = -1, lastSlice = -1, lastRender = -1;
     bool wasPlaying = false;
     String status;

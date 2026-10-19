@@ -18,6 +18,12 @@ namespace IDs
     inline constexpr const char* swell     = "swell";
     inline constexpr const char* width     = "width";
     inline constexpr const char* output    = "output";
+    inline constexpr const char* engine    = "engine";
+    inline constexpr const char* land      = "land";
+    inline constexpr const char* revSize   = "revSize";
+    inline constexpr const char* revTone   = "revTone";
+    inline constexpr const char* revPre    = "revPreDelay";
+    inline constexpr const char* blend     = "blend";
 }
 
 /** The loaded sound (max 20 s, always stereo). Immutable once created. */
@@ -42,6 +48,7 @@ public:
     void releaseResources() override {}
     bool isBusesLayoutSupported (const BusesLayout&) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    using juce::AudioProcessor::processBlock;
 
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override                       { return true; }
@@ -138,6 +145,9 @@ private:
     std::atomic<float>* pPitch = nullptr;  std::atomic<float>* pSweep = nullptr;
     std::atomic<float>* pSpace = nullptr;  std::atomic<float>* pSwell = nullptr;
     std::atomic<float>* pWidth = nullptr;  std::atomic<float>* pOutput = nullptr;
+    std::atomic<float>* pEngine = nullptr; std::atomic<float>* pLand = nullptr;
+    std::atomic<float>* pRevSize = nullptr; std::atomic<float>* pRevTone = nullptr;
+    std::atomic<float>* pRevPre = nullptr; std::atomic<float>* pBlend = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SunRiserProcessor)
 };

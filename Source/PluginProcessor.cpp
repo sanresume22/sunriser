@@ -45,6 +45,9 @@ SunRiserProcessor::SunRiserProcessor()
     pPitch  = apvts.getRawParameterValue (IDs::pitch);   pSweep  = apvts.getRawParameterValue (IDs::sweep);
     pSpace  = apvts.getRawParameterValue (IDs::space);   pSwell  = apvts.getRawParameterValue (IDs::swell);
     pWidth  = apvts.getRawParameterValue (IDs::width);   pOutput = apvts.getRawParameterValue (IDs::output);
+    pEngine = apvts.getRawParameterValue (IDs::engine);  pLand   = apvts.getRawParameterValue (IDs::land);
+    pRevSize = apvts.getRawParameterValue (IDs::revSize); pRevTone = apvts.getRawParameterValue (IDs::revTone);
+    pRevPre = apvts.getRawParameterValue (IDs::revPre);  pBlend  = apvts.getRawParameterValue (IDs::blend);
 
     outGain.reset (48000.0, 0.02);
     outGain.setCurrentAndTargetValue (1.0f);
@@ -85,6 +88,20 @@ juce::AudioProcessorValueTreeState::ParameterLayout SunRiserProcessor::createLay
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { IDs::width, 1 }, "Width", NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.5f,  pctAttr()));
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { IDs::output, 1 }, "Output", NormalisableRange<float> (-24.0f, 6.0f, 0.1f), 0.0f,
                 AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return (v > 0 ? "+" : "") + String (v, 1) + " dB"; })));
+
+    // Reverse swell
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { IDs::engine, 1 }, "Mode", StringArray { "Stutter", "Reverse", "Both" }, 0));
+    layout.add (std::make_unique<AudioParameterBool>   (ParameterID { IDs::land, 1 },   "Land on Drop", false));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { IDs::revSize, 1 }, "Reverse Size", NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.8f, pctAttr()));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { IDs::revTone, 1 }, "Reverse Tone", NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.55f, pctAttr()));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { IDs::revPre, 1 },  "Gap", NormalisableRange<float> (0.0f, 250.0f, 1.0f), 0.0f,
+                AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return String (roundToInt (v)) + " ms"; })));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { IDs::blend, 1 },   "Blend", NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.5f,
+                AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int)
+                {
+                    const int rv = roundToInt (v * 100.0f);
+                    return rv <= 2 ? String ("Stutter") : rv >= 98 ? String ("Reverse") : String (100 - rv) + " / " + String (rv);
+                })));
     return layout;
 }
 
@@ -217,6 +234,12 @@ RiserSettings SunRiserProcessor::currentSettings() const
     s.beatsNum   = juce::jlimit (1, 32, hostNum.load());
     s.beatsDen   = juce::jlimit (1, 32, hostDen.load());
     s.sampleRate = getSampleRate() > 0 ? getSampleRate() : 48000.0;
+    s.engine        = juce::jlimit (0, 2, (int) pEngine->load());
+    s.land          = pLand->load() > 0.5f;
+    s.revSize       = pRevSize->load();
+    s.revTone       = pRevTone->load();
+    s.revPreDelayMs = pRevPre->load();
+    s.blend         = pBlend->load();
     return s;
 }
 
@@ -413,7 +436,9 @@ juce::File SunRiserProcessor::exportRiserToTempFile()
     dir.createDirectory();
     const double bpm = r->settings.bpm;
     const auto bpmText = std::abs (bpm - std::round (bpm)) < 0.01 ? juce::String (juce::roundToInt (bpm)) : juce::String (bpm, 1);
-    const auto name = juce::File::createLegalFileName ("SunRiser - " + src->name + " - " + juce::String (r->settings.bars)
+    static const char* modeNames[] = { "", "reverse ", "stutter+reverse " };
+    const auto name = juce::File::createLegalFileName ("SunRiser - " + src->name + " - " + modeNames[juce::jlimit (0, 2, r->settings.engine)]
+                                                      + juce::String (r->settings.bars)
                                                       + (r->settings.bars == 1 ? " bar " : " bars ") + bpmText + "bpm.wav");
     return exportRiser (dir.getChildFile (name));
 }

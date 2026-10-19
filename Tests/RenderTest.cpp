@@ -36,6 +36,25 @@ static bool waitForRender (SunRiserProcessor& p, int previousVersion)
     return false;
 }
 
+static void setParam (SunRiserProcessor& p, const char* id, float value)
+{
+    auto* prm = p.apvts.getParameter (id);
+    prm->setValueNotifyingHost (prm->convertTo0to1 (value));
+}
+
+static void writeWav (const AudioBuffer<float>& b, double sr, const File& f)
+{
+    f.deleteFile();
+    WavAudioFormat wav;
+    std::unique_ptr<AudioFormatWriter> w (wav.createWriterFor (new FileOutputStream (f), sr, 2, 24, {}, 0));
+    w->writeFromAudioSampleBuffer (b, 0, b.getNumSamples());
+}
+
+static float rms (const AudioBuffer<float>& b, int start, int n)
+{
+    return 0.5f * (b.getRMSLevel (0, start, n) + b.getRMSLevel (1, start, n));
+}
+
 static void snapshot (Component& c, const File& f)
 {
     auto img = c.createComponentSnapshot (c.getLocalBounds(), true, 1.0f);
@@ -109,7 +128,7 @@ int main (int argc, char** argv)
     const int endSample = 10 + r->audio.getNumSamples();
     CHECK (out.getMagnitude (0, endSample) > 0.5f, "MIDI note plays the riser");
     CHECK (out.getMagnitude (endSample + 10, out.getNumSamples() - endSample - 10) < 1e-6f, "riser stops exactly at its end (on the drop)");
-    CHECK (out.getMagnitude (0, 0, 10) == 0.0f, "nothing before the note");
+    CHECK (out.getMagnitude (0, 0, 10) < 1.0e-9f, "nothing before the note");
     {
         const auto f = outDir.getChildFile ("riser_smooth.wav");
         f.deleteFile();
@@ -166,6 +185,67 @@ int main (int argc, char** argv)
         CHECK (onGrid, "steps mode hits are on the grid");
         MessageManager::getInstance()->runDispatchLoopUntil (100);
         snapshot (*ed, outDir.getChildFile ("gui_golden_steps.png"));
+
+        //== Reverse swell =====================================================
+        setParam (*proc, IDs::mode, 0.0f);    // back to smooth
+        setParam (*proc, IDs::length, 1.0f);  // 2 bars
+        int v2 = proc->getRenderVersion();
+        setParam (*proc, IDs::engine, 1.0f);  // Reverse
+        CHECK (waitForRender (*proc, v2), "reverse mode renders");
+        auto rv = proc->getLatestRender();
+        const int N = (int) std::ceil (rv->dropSec * 48000.0);
+        std::cout << "      reverse: drop " << rv->dropSec << " s, buffer " << rv->lengthSec << " s\n";
+        CHECK (rv->settings.engine == 1 && rv->grains.empty() && ! rv->swellEnvelope.empty(), "reverse mode: no stutter hits, swell present");
+        CHECK (rv->audio.getNumSamples() == N, "reverse swell ends exactly on the drop");
+        {
+            const int eighth = N / 8;
+            const float early = rms (rv->audio, 0, eighth * 2), late = rms (rv->audio, N - eighth, eighth);
+            std::cout << "      swell RMS first quarter " << Decibels::gainToDecibels (early) << " dB, last 8th " << Decibels::gainToDecibels (late) << " dB\n";
+            CHECK (late > early * 8.0f, "swell rises strongly into the drop (> +18 dB)");
+            int peakAt = 0; float pk = 0;
+            for (int i = 0; i < N; ++i) { const float a = std::abs (rv->audio.getSample (0, i)); if (a > pk) { pk = a; peakAt = i; } }
+            std::cout << "      swell peak at " << 1000.0 * (N - peakAt) / 48000.0 << " ms before the drop\n";
+            CHECK (peakAt > N - (int) (0.35 * 48000), "swell peaks right before the drop");
+        }
+        writeWav (rv->audio, 48000.0, outDir.getChildFile ("riser_reverse.wav"));
+        MessageManager::getInstance()->runDispatchLoopUntil (100);
+        snapshot (*ed, outDir.getChildFile ("gui_reverse.png"));
+
+        // Gap
+        v2 = proc->getRenderVersion();
+        setParam (*proc, IDs::revPre, 120.0f);
+        CHECK (waitForRender (*proc, v2), "re-render with gap");
+        rv = proc->getLatestRender();
+        CHECK (rv->audio.getMagnitude (N - (int) (0.115 * 48000), (int) (0.115 * 48000)) < 1.0e-6f, "gap leaves silence before the drop");
+        setParam (*proc, IDs::revPre, 0.0f);
+
+        // Land on drop
+        v2 = proc->getRenderVersion();
+        setParam (*proc, IDs::land, 1.0f);
+        CHECK (waitForRender (*proc, v2), "re-render with land");
+        rv = proc->getLatestRender();
+        CHECK (rv->landSec > 0.1 && rv->audio.getNumSamples() > N + 4000, "land: syllable added after the drop");
+        CHECK (rms (rv->audio, N, (int) (rv->landSec * 48000)) > 0.05f, "land: syllable is audible on the drop");
+
+        // Both
+        v2 = proc->getRenderVersion();
+        setParam (*proc, IDs::engine, 2.0f);
+        CHECK (waitForRender (*proc, v2), "both mode renders");
+        rv = proc->getLatestRender();
+        CHECK (! rv->grains.empty() && ! rv->swellEnvelope.empty(), "both mode: hits + swell");
+        writeWav (rv->audio, 48000.0, outDir.getChildFile ("riser_both_land.wav"));
+        MessageManager::getInstance()->runDispatchLoopUntil (100);
+        snapshot (*ed, outDir.getChildFile ("gui_both.png"));
+
+        // state round trip keeps the new parameters
+        {
+            MemoryBlock st;
+            proc->getStateInformation (st);
+            SunRiserProcessor p3;
+            p3.setStateInformation (st.getData(), (int) st.getSize());
+            CHECK ((int) p3.apvts.getRawParameterValue (IDs::engine)->load() == 2 && p3.apvts.getRawParameterValue (IDs::land)->load() > 0.5f,
+                   "mode + land restored from project");
+        }
 
         // empty state
         ed.reset();

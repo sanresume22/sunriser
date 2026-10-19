@@ -98,24 +98,15 @@ SyllableRange detectFirstSyllable (const juce::AudioBuffer<float>& src, double s
 }
 
 //==============================================================================
-RenderedRiser::Ptr renderRiser (const juce::AudioBuffer<float>& slice, double sliceRate, const RiserSettings& s)
+// Stutter engine: accelerating, pitch-rising repeats of the syllable (length N = up to the drop)
+static void renderStutter (const juce::AudioBuffer<float>& slice, double sliceRate, const RiserSettings& s,
+                           double sr, double qSec, double totalQ, int N,
+                           juce::AudioBuffer<float>& out, std::vector<Grain>& grains)
 {
-    RenderedRiser::Ptr r = new RenderedRiser();
-    r->settings = s;
-
-    const double sr     = juce::jlimit (8000.0, 768000.0, s.sampleRate);
-    const double qSec   = 60.0 / juce::jlimit (20.0, 999.0, s.bpm);
-    const double barQ   = s.beatsNum * 4.0 / (double) juce::jmax (1, s.beatsDen);
-    const double totalQ = juce::jmax (1, s.bars) * barQ;
-    const double L      = totalQ * qSec;
-    const int    N      = juce::jmax (1, (int) std::ceil (L * sr));
+    out.setSize (2, N);
+    out.clear();
     const double startQ = juce::jmax (s.startDivQ, s.endDivQ);
     const double endQ   = juce::jmin (s.startDivQ, s.endDivQ);
-
-    r->lengthSec   = L;
-    r->beatsPerBar = barQ;
-    r->audio.setSize (2, N);
-    r->audio.clear();
 
     //== 1. Schedule the repeats ===============================================
     auto addGrain = [&] (double tq, double lenQ)
@@ -126,8 +117,8 @@ RenderedRiser::Ptr renderRiser (const juce::AudioBuffer<float>& slice, double sl
         g.lengthSec = juce::jmax (0.0, lenQ) * qSec;
         g.gain      = swellGainAt (p, s.swell);
         g.semis     = pitchAt (p, s.pitch);
-        g.pan       = ((r->grains.size() & 1) ? 1.0f : -1.0f) * s.width * p;
-        r->grains.push_back (g);
+        g.pan       = ((grains.size() & 1) ? 1.0f : -1.0f) * s.width * p;
+        grains.push_back (g);
     };
 
     if (! s.stepMode)
@@ -135,7 +126,7 @@ RenderedRiser::Ptr renderRiser (const juce::AudioBuffer<float>& slice, double sl
         // Smooth: the repeat length glides exponentially from startQ to endQ
         const double expo = 0.5 + s.curve * 2.0;
         double tq = 0.0;
-        while (tq < totalQ - 1.0e-6 && r->grains.size() < 4000)
+        while (tq < totalQ - 1.0e-6 && grains.size() < 4000)
         {
             const double p  = tq / totalQ;
             const double iq = startQ * std::pow (endQ / startQ, std::pow (p, expo));
@@ -167,16 +158,16 @@ RenderedRiser::Ptr renderRiser (const juce::AudioBuffer<float>& slice, double sl
     //== 2. Play the syllable for each repeat =================================
     const int sliceLen = slice.getNumSamples();
     if (sliceLen < 4 || slice.getNumChannels() == 0)
-        return r;
+        return;
 
     const float* srcL = slice.getReadPointer (0);
     const float* srcR = slice.getReadPointer (slice.getNumChannels() > 1 ? 1 : 0);
-    float* outL = r->audio.getWritePointer (0);
-    float* outR = r->audio.getWritePointer (1);
-    const double baseInc  = sliceRate / sr;
-    const double srcFade  = juce::jmax (1.0, 0.004 * sliceRate);
+    float* outL = out.getWritePointer (0);
+    float* outR = out.getWritePointer (1);
+    const double baseInc = sliceRate / sr;
+    const double srcFade = juce::jmax (1.0, 0.004 * sliceRate);
 
-    for (const auto& g : r->grains)
+    for (const auto& g : grains)
     {
         const int s0  = (int) std::llround (g.startSec * sr);
         const int len = juce::jmin ((int) std::llround (g.lengthSec * sr), N - s0);
@@ -250,7 +241,7 @@ RenderedRiser::Ptr renderRiser (const juce::AudioBuffer<float>& slice, double sl
         }
     }
 
-    //== 5. Tidy up: tiny end fade, normalise to -1 dBFS ========================
+    // tiny fade into the drop
     const int endFade = juce::jmin (N, (int) (0.003 * sr));
     for (int i = 0; i < endFade; ++i)
     {
@@ -258,9 +249,241 @@ RenderedRiser::Ptr renderRiser (const juce::AudioBuffer<float>& slice, double sl
         outL[N - 1 - i] *= gn;
         outR[N - 1 - i] *= gn;
     }
-    const float pk = r->audio.getMagnitude (0, N);
-    if (pk > 1.0e-6f)
-        r->audio.applyGain (0.89f / pk);
+}
+
+//==============================================================================
+/** Dense stereo feedback-delay-network reverb with an exact RT60, used for the reverse swell. */
+class LongReverb
+{
+public:
+    LongReverb (double sr, float rt60Sec, float tone)
+    {
+        static const float lineMs[kLines] = { 31.3f, 37.9f, 41.7f, 47.3f, 53.1f, 61.7f, 67.9f, 73.3f };
+        static const float apMs[kAps]     = { 4.77f, 3.59f, 12.73f, 9.31f };
+        for (int i = 0; i < kLines; ++i)
+        {
+            const int len = juce::jmax (8, (int) (lineMs[i] * 0.001 * sr));
+            lines[i].assign ((size_t) len, 0.0f);
+            gains[i] = (float) std::pow (10.0, -3.0 * len / (juce::jmax (0.05f, rt60Sec) * sr));
+        }
+        for (int i = 0; i < kAps; ++i)
+            aps[i].assign ((size_t) juce::jmax (4, (int) (apMs[i] * 0.001 * sr)), 0.0f);
+
+        // Tone: dark (1.5 kHz damping) .. bright (14 kHz)
+        const double dampHz = 1500.0 * std::pow (14000.0 / 1500.0, (double) tone);
+        dampCoef = (float) (1.0 - std::exp (-juce::MathConstants<double>::twoPi * dampHz / sr));
+    }
+
+    void process (float in, float& outL, float& outR)
+    {
+        // input diffusion
+        for (int i = 0; i < kAps; ++i)
+        {
+            auto& b = aps[i];
+            const float delayed = b[(size_t) apIdx[i]];
+            const float y = -0.6f * in + delayed;
+            b[(size_t) apIdx[i]] = in + 0.6f * y;
+            apIdx[i] = (apIdx[i] + 1) % (int) b.size();
+            in = y;
+        }
+
+        float y[kLines], sum = 0.0f;
+        for (int i = 0; i < kLines; ++i)
+        {
+            const float d = lines[i][(size_t) idx[i]];
+            damp[i] += dampCoef * (d - damp[i]);
+            y[i] = damp[i];
+            sum += y[i];
+        }
+        sum *= 2.0f / (float) kLines; // Householder feedback matrix
+        static const float inSign[kLines] = { 1, -1, 1, -1, 1, 1, -1, -1 };
+        for (int i = 0; i < kLines; ++i)
+        {
+            lines[i][(size_t) idx[i]] = (y[i] - sum) * gains[i] + in * inSign[i];
+            idx[i] = (idx[i] + 1) % (int) lines[i].size();
+        }
+        outL = 0.25f * (y[0] - y[1] + y[2] - y[3] + y[4] - y[5] + y[6] - y[7]);
+        outR = 0.25f * (y[0] + y[1] - y[2] - y[3] + y[4] + y[5] - y[6] - y[7]);
+    }
+
+private:
+    static constexpr int kLines = 8, kAps = 4;
+    std::vector<float> lines[kLines], aps[kAps];
+    float gains[kLines] {}, damp[kLines] {};
+    int idx[kLines] {}, apIdx[kAps] {};
+    float dampCoef = 0.5f;
+};
+
+/** Resamples the slice to the output rate. */
+static juce::AudioBuffer<float> resampleSlice (const juce::AudioBuffer<float>& slice, double sliceRate, double sr)
+{
+    const int n = slice.getNumSamples();
+    const double ratio = sliceRate / sr;
+    const int outN = juce::jmax (1, (int) std::floor ((n - 1) / ratio));
+    juce::AudioBuffer<float> out (2, outN);
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        const float* src = slice.getReadPointer (juce::jmin (ch, slice.getNumChannels() - 1));
+        float* d = out.getWritePointer (ch);
+        for (int i = 0; i < outN; ++i)
+            d[i] = hermite (src, n, i * ratio);
+    }
+    return out;
+}
+
+/** Reverse swell: reverse the syllable -> long reverb (100% wet) -> reverse again.
+    The swell rises until `dropSample` (minus the optional gap) and is cut there. */
+static juce::AudioBuffer<float> renderReverseSwell (const juce::AudioBuffer<float>& dry, const RiserSettings& s,
+                                                    double sr, int dropSample)
+{
+    const int len = dry.getNumSamples();
+    const int gap = juce::jmin (dropSample / 2, (int) (juce::jlimit (0.0f, 500.0f, s.revPreDelayMs) * 0.001 * sr));
+    const int cut = dropSample - gap;   // where the swell stops
+    // Size: the reverb's RT60 is a fraction of the riser length, so the swell fills the bars you choose
+    const float rt60 = (float) (cut / sr) * (0.4f + 1.2f * juce::jlimit (0.0f, 1.0f, s.revSize));
+    const int wetLen = len + (int) (rt60 * sr);
+
+    // 1+2. reverse the syllable and feed it through the reverb (100% wet)
+    juce::AudioBuffer<float> wet (2, wetLen);
+    LongReverb rev (sr, rt60, s.revTone);
+    const float* dl = dry.getReadPointer (0);
+    const float* dr = dry.getReadPointer (1);
+    float* wl = wet.getWritePointer (0);
+    float* wr = wet.getWritePointer (1);
+    for (int t = 0; t < wetLen; ++t)
+    {
+        const float in = t < len ? 0.5f * (dl[len - 1 - t] + dr[len - 1 - t]) : 0.0f;
+        rev.process (in, wl[t], wr[t]);
+    }
+
+    // clean the low end of the wet signal
+    {
+        juce::dsp::StateVariableTPTFilter<float> hp;
+        hp.prepare ({ sr, 512, 2 });
+        hp.setType (juce::dsp::StateVariableTPTFilterType::highpass);
+        hp.setCutoffFrequency (120.0f);
+        for (int t = 0; t < wetLen; ++t)
+        {
+            wl[t] = hp.processSample (0, wl[t]);
+            wr[t] = hp.processSample (1, wr[t]);
+        }
+    }
+
+    // 3. reverse again. In the reversed timeline the original syllable would start at
+    //    k0 = wetLen - len: that is where the swell peaks, so line it up with the cut point.
+    const int k0 = wetLen - len;
+    const int offset = cut - k0;                  // output index of reversed sample 0
+    juce::AudioBuffer<float> out (2, dropSample);
+    out.clear();
+    for (int o = juce::jmax (0, offset); o < cut; ++o)
+    {
+        const int k = o - offset;
+        out.setSample (0, o, wl[wetLen - 1 - k]);
+        out.setSample (1, o, wr[wetLen - 1 - k]);
+    }
+
+    // smooth fade-in over the first 8th of the riser, quick fade at the cut
+    const int fi = juce::jmax (1, cut / 8);
+    for (int i = 0; i < fi; ++i)
+    {
+        const float g = std::sin ((float) i / (float) fi * juce::MathConstants<float>::halfPi);
+        for (int ch = 0; ch < 2; ++ch) out.setSample (ch, i, out.getSample (ch, i) * g * g);
+    }
+    const int fo = juce::jmin (cut, (int) (0.004 * sr));
+    for (int i = 0; i < fo; ++i)
+        for (int ch = 0; ch < 2; ++ch) out.setSample (ch, cut - 1 - i, out.getSample (ch, cut - 1 - i) * (float) i / (float) fo);
+    return out;
+}
+
+static void normaliseTo (juce::AudioBuffer<float>& b, float target)
+{
+    const float pk = b.getMagnitude (0, b.getNumSamples());
+    if (pk > 1.0e-6f) b.applyGain (target / pk);
+}
+
+//==============================================================================
+RenderedRiser::Ptr renderRiser (const juce::AudioBuffer<float>& slice, double sliceRate, const RiserSettings& s)
+{
+    RenderedRiser::Ptr r = new RenderedRiser();
+    r->settings = s;
+
+    const double sr     = juce::jlimit (8000.0, 768000.0, s.sampleRate);
+    const double qSec   = 60.0 / juce::jlimit (20.0, 999.0, s.bpm);
+    const double barQ   = s.beatsNum * 4.0 / (double) juce::jmax (1, s.beatsDen);
+    const double totalQ = juce::jmax (1, s.bars) * barQ;
+    const double L      = totalQ * qSec;
+    const int    N      = juce::jmax (1, (int) std::ceil (L * sr));
+
+    r->dropSec     = L;
+    r->lengthSec   = L;
+    r->beatsPerBar = barQ;
+    r->audio.setSize (2, N);
+    r->audio.clear();
+
+    if (slice.getNumSamples() < 4 || slice.getNumChannels() == 0)
+        return r;
+
+    const bool useStutter = s.engine != engineReverse;
+    const bool useReverse = s.engine != engineStutter;
+    const float blend = juce::jlimit (0.0f, 1.0f, s.blend);
+    const float wStutter = s.engine == engineBoth ? std::cos (blend * juce::MathConstants<float>::halfPi) : 1.0f;
+    const float wReverse = s.engine == engineBoth ? std::sin (blend * juce::MathConstants<float>::halfPi) : 1.0f;
+
+    const auto dry = resampleSlice (slice, sliceRate, sr);
+
+    juce::AudioBuffer<float> stutter, swell;
+    if (useStutter)
+    {
+        renderStutter (slice, sliceRate, s, sr, qSec, totalQ, N, stutter, r->grains);
+        normaliseTo (stutter, 0.89f * wStutter);
+    }
+    if (useReverse)
+    {
+        swell = renderReverseSwell (dry, s, sr, N);
+        normaliseTo (swell, 0.89f * wReverse);
+    }
+
+    const int landLen = s.land ? dry.getNumSamples() : 0;
+    const int total = juce::jmax (N, swell.getNumSamples(), N + landLen);
+    r->audio.setSize (2, total, false, true, false);
+    r->audio.clear();
+
+    if (useStutter) for (int ch = 0; ch < 2; ++ch) r->audio.addFrom (ch, 0, stutter, ch, 0, stutter.getNumSamples());
+    if (useReverse) for (int ch = 0; ch < 2; ++ch) r->audio.addFrom (ch, 0, swell, ch, 0, swell.getNumSamples());
+
+    if (landLen > 0)
+    {
+        const float pk = dry.getMagnitude (0, landLen);
+        const float g = pk > 1.0e-6f ? 0.8f / pk : 0.0f;
+        for (int ch = 0; ch < 2; ++ch) r->audio.addFrom (ch, N, dry, ch, 0, landLen, g);
+        r->landSec = landLen / sr;
+    }
+
+    // normalise the whole thing to -1 dBFS
+    const float peak = r->audio.getMagnitude (0, total);
+    const float norm = peak > 1.0e-6f ? 0.89f / peak : 1.0f;
+    r->audio.applyGain (norm);
+    r->lengthSec = total / sr;
+
+    // swell envelope for the GUI (relative to full scale)
+    if (useReverse)
+    {
+        const int bins = 600;
+        r->swellEnvelope.assign ((size_t) bins, 0.0f);
+        const int n = swell.getNumSamples();
+        for (int b = 0; b < bins; ++b)
+        {
+            const int a = (int) ((juce::int64) b * total / bins), e = (int) ((juce::int64) (b + 1) * total / bins);
+            float m = 0.0f;
+            for (int i = a; i < juce::jmin (e, n); ++i)
+                m = juce::jmax (m, std::abs (swell.getSample (0, i)), std::abs (swell.getSample (1, i)));
+            r->swellEnvelope[(size_t) b] = juce::jmin (1.0f, m * norm / 0.89f);
+        }
+    }
+
+    // stutter hit heights follow the blend in Both mode
+    if (useStutter && s.engine == engineBoth)
+        for (auto& g : r->grains) g.gain *= juce::jmax (0.15f, wStutter);
 
     return r;
 }
