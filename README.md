@@ -47,9 +47,9 @@ Push this folder to a GitHub repository. The included workflow (`.github/workflo
 Download them from the run's *Artifacts* section (Actions tab).
 
 ### Windows (local)
-Install Visual Studio 2022 ("Desktop development with C++") and CMake. Then:
+Install Visual Studio 2022 or newer ("Desktop development with C++") and CMake. Then:
 
-    cmake -B build -G "Visual Studio 17 2022" -A x64
+    cmake -B build -A x64
     cmake --build build --config Release --target SunRiser_VST3
 
 ### macOS (local)
