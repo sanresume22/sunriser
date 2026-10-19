@@ -68,9 +68,9 @@ Output is in `build/SunRiser_artefacts/Release/`.
 | macOS | `SunRiser.vst3` | `/Library/Audio/Plug-Ins/VST3/` |
 | macOS | `SunRiser.component` | `/Library/Audio/Plug-Ins/Components/` |
 
-- **Ableton Live:** Settings > Plug-Ins > turn on "Use VST3 Plug-in System Folders" > Rescan. SunRiser is under Plug-ins > VST3.
+- **Ableton Live:** Settings > Plug-Ins > turn on "Use VST3 Plug-in System Folders" > Rescan. SunRiser is under Plug-ins > VST3 > Sunny Plugins.
 - **FL Studio:** Options > Manage plugins > Find more plugins, then add SunRiser to the Channel Rack.
-- **Logic Pro:** It appears under AU Instruments > MyStudio > SunRiser on a Software Instrument track.
+- **Logic Pro:** It appears under AU Instruments > Sunny Plugins > SunRiser on a Software Instrument track.
 
 **macOS builds are unsigned.** If macOS blocks the plugin, run this once in Terminal:
 

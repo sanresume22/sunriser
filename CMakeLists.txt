@@ -25,9 +25,10 @@ endif()
 # VST3 -> Ableton Live, FL Studio, Cubase, Bitwig, Studio One, Reaper...
 # AU   -> Logic Pro, GarageBand (built automatically on macOS only)
 juce_add_plugin(SunRiser
-    COMPANY_NAME "MyStudio"
-    BUNDLE_ID com.mystudio.sunriser
-    PLUGIN_MANUFACTURER_CODE Mstd
+    COMPANY_NAME "Sunny Plugins"
+    COMPANY_WEBSITE "https://github.com/sanresume22/sunriser"
+    BUNDLE_ID com.sunnyplugins.sunriser
+    PLUGIN_MANUFACTURER_CODE Snny
     PLUGIN_CODE SnRs
     FORMATS VST3 AU Standalone
     PRODUCT_NAME "SunRiser"
